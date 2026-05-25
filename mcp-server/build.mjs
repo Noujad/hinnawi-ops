@@ -7,7 +7,11 @@ await build({
   target: "node20",
   format: "esm",
   outfile: "mcp-server/dist/index.mjs",
-  external: ["mysql2"],
+  external: [
+    "mysql2",
+    "@hono/node-server",
+    "hono",
+  ],
   banner: {
     js: `import { createRequire } from 'module'; const require = createRequire(import.meta.url);`,
   },

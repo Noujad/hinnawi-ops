@@ -4,6 +4,7 @@ import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
+import { registerMcpRoutes } from "../mcpRoutes";
 import { registerQboOAuthRoutes } from "../qboRoutes";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
@@ -41,6 +42,8 @@ async function startServer() {
   registerOAuthRoutes(app);
   // QBO OAuth routes
   registerQboOAuthRoutes(app);
+  // MCP (Model Context Protocol) Streamable HTTP endpoint
+  registerMcpRoutes(app);
   // tRPC API
   app.use(
     "/api/trpc",

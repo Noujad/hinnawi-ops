@@ -1,60 +1,48 @@
-#!/usr/bin/env node
 /**
- * Hinnawi Ops MCP Server — Read-Only Accounting Data
+ * MCP (Model Context Protocol) Routes — Streamable HTTP Transport
  * 
- * Remote Streamable HTTP MCP server with:
- * - Stateless transport (no sessions, no Redis)
- * - OAuth 2.1 (Authorization Code + PKCE) auth
- * - Secret key auth via ?key= query param, Authorization: Bearer, or x-mcp-key header
+ * Registers /api/mcp, OAuth 2.1 discovery, and auth endpoints on the Express app.
+ * Stateless: fresh McpServer + transport per request.
+ * 
+ * Auth: ?key=MCP_SECRET, Authorization: Bearer, or x-mcp-key header.
+ * OAuth 2.1: Authorization Code + PKCE (auto-approve, machine-to-machine).
  * 
  * Environment variables:
- *   DATABASE_URL   — MySQL/TiDB connection string (required)
- *   MCP_SECRET     — Static secret for key-based auth (required)
- *   OAUTH_CLIENT_ID     — OAuth 2.1 client ID
- *   OAUTH_CLIENT_SECRET — OAuth 2.1 client secret
- *   PUBLIC_URL     — Public base URL (e.g. https://mcp.example.com)
- *   PORT           — HTTP port (default 3001)
+ *   MCP_SECRET          — Static secret for key-based auth (required)
+ *   MCP_OAUTH_CLIENT_ID     — OAuth 2.1 client ID
+ *   MCP_OAUTH_CLIENT_SECRET — OAuth 2.1 client secret
  */
 
-import express from "express";
-import cors from "cors";
+import { Express, Request, Response } from "express";
 import crypto from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { drizzle } from "drizzle-orm/mysql2";
 import { eq, sql, desc, and, gte, lte, asc } from "drizzle-orm";
+import { getDb } from "./db";
 import {
-  locations, dailySales, invoices, invoiceLineItems, suppliers,
-  payrollRecords, qboEntities, productSales, revenueJournalEntries,
-  qboAccountCache
+  locations, dailySales, invoices, suppliers, payrollRecords,
+  qboEntities, productSales, revenueJournalEntries, qboAccountCache
 } from "../drizzle/schema";
 
 // ─── Configuration ───
-const PORT = parseInt(process.env.PORT || "3001", 10);
 const MCP_SECRET = process.env.MCP_SECRET || "";
-const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
-const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
-const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+const OAUTH_CLIENT_ID = process.env.MCP_OAUTH_CLIENT_ID || "";
+const OAUTH_CLIENT_SECRET = process.env.MCP_OAUTH_CLIENT_SECRET || "";
 
-if (!MCP_SECRET) {
-  console.error("FATAL: MCP_SECRET environment variable is required");
-  process.exit(1);
-}
-
-// ─── Database Connection ───
-let _db: ReturnType<typeof drizzle> | null = null;
-function getDb() {
-  if (!_db) {
-    const url = process.env.DATABASE_URL;
-    if (!url) throw new Error("DATABASE_URL environment variable is required");
-    _db = drizzle(url);
+function getPublicUrl(req: Request): string {
+  // Always derive from request headers for correct behavior behind proxies
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost:3000";
+  // Allow PUBLIC_URL override only if explicitly set and not localhost
+  if (process.env.PUBLIC_URL && !process.env.PUBLIC_URL.includes("localhost")) {
+    return process.env.PUBLIC_URL;
   }
-  return _db;
+  return `${proto}://${host}`;
 }
 
 // ─── Helper: format date from Date object to YYYY-MM-DD ───
-function toDateStr(d: Date | string | null): string {
+function toDateStr(d: Date | string | null | undefined): string {
   if (!d) return "";
   if (typeof d === "string") return d;
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
@@ -78,15 +66,21 @@ interface AccessToken {
 const authCodes = new Map<string, AuthCode>();
 const accessTokens = new Map<string, AccessToken>();
 
-// Clean up expired tokens periodically
+// Clean up expired tokens every 60s
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of authCodes) if (v.expiresAt < now) authCodes.delete(k);
   for (const [k, v] of accessTokens) if (v.expiresAt < now) accessTokens.delete(k);
 }, 60_000);
 
-// ─── Auth Middleware ───
-function authenticate(req: express.Request, res: express.Response): boolean {
+// ─── Auth Check ───
+function authenticate(req: Request, res: Response): boolean {
+  // If MCP_SECRET is not configured, MCP is disabled
+  if (!MCP_SECRET) {
+    res.status(503).json({ error: "MCP not configured" });
+    return false;
+  }
+
   // Method 1: ?key= query parameter
   const keyParam = req.query.key as string | undefined;
   if (keyParam && keyParam === MCP_SECRET) return true;
@@ -95,9 +89,7 @@ function authenticate(req: express.Request, res: express.Response): boolean {
   const authHeader = req.headers.authorization;
   if (authHeader?.startsWith("Bearer ")) {
     const token = authHeader.slice(7);
-    // Check if it's the static secret
     if (token === MCP_SECRET) return true;
-    // Check if it's a valid OAuth access token
     const oauthToken = accessTokens.get(token);
     if (oauthToken && oauthToken.expiresAt > Date.now()) return true;
   }
@@ -110,7 +102,7 @@ function authenticate(req: express.Request, res: express.Response): boolean {
   return false;
 }
 
-// ─── Create MCP Server with all tools ───
+// ─── Create MCP Server with all 11 read-only tools ───
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "hinnawi-ops-accounting",
@@ -119,16 +111,7 @@ function createMcpServer(): McpServer {
     capabilities: { tools: {} },
     instructions: `Hinnawi Ops Accounting MCP Server — Read-only access to financial data for Bagel & Cafe restaurant chain (4 locations: President Kennedy/PK-MK, Mackay, Cathcart Tunnel, Ontario).
 
-Available data:
-- Daily sales (revenue, taxes, tips, deposits, labor costs)
-- Revenue journal entries (POS-generated JEs for QuickBooks)
-- Invoices and accounts payable
-- Suppliers/vendors
-- Payroll records
-- Product-level sales with food cost analysis
-- QuickBooks Online entity information
-- Chart of accounts from QBO
-
+Available data: daily sales, revenue journal entries, invoices/AP, suppliers, payroll, product sales, QBO entities, chart of accounts.
 All monetary values are in CAD. Fiscal year runs Sep 1 – Aug 31.
 Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
   });
@@ -139,11 +122,12 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
     "List all cafe locations with their codes, names, and targets",
     {},
     async () => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const rows = await db.select().from(locations).orderBy(asc(locations.id));
       return {
         content: [{
-          type: "text",
+          type: "text" as const,
           text: JSON.stringify(rows.map(r => ({
             id: r.id, code: r.code, name: r.name, entityName: r.entityName,
             address: r.address, laborTarget: r.laborTarget, foodCostTarget: r.foodCostTarget, isActive: r.isActive,
@@ -163,7 +147,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       location_id: z.number().optional().describe("Filter by location ID (1=PK, 2=Mackay, 3=Ontario, 4=Cathcart)"),
     },
     async ({ start_date, end_date, location_id }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const conditions: any[] = [
         gte(dailySales.saleDate, new Date(start_date)),
         lte(dailySales.saleDate, new Date(end_date)),
@@ -176,14 +161,14 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
         .limit(500);
 
       const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate),
+        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
         totalSales: r.totalSales, taxExemptSales: r.taxExemptSales, taxableSales: r.taxableSales,
         gstCollected: r.gstCollected, qstCollected: r.qstCollected, totalDeposit: r.totalDeposit,
         tipsCollected: r.tipsCollected, merchantFees: r.merchantFees, pettyCash: r.pettyCash,
         discounts: r.discounts, labourCost: r.labourCost, orderCount: r.orderCount,
       }));
 
-      return { content: [{ type: "text", text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
     }
   );
 
@@ -199,7 +184,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       limit: z.number().optional().default(100).describe("Max results (default 100)"),
     },
     async ({ status, location_id, start_date, end_date, limit }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const conditions: any[] = [];
       if (status) conditions.push(eq(revenueJournalEntries.status, status));
       if (location_id) conditions.push(eq(revenueJournalEntries.locationId, location_id));
@@ -212,16 +198,15 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
         .limit(limit || 100);
 
       const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate),
+        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
         realmId: r.realmId, docNumber: r.docNumber, status: r.status,
         totalSales: r.totalSales, netRevenue: r.netRevenue, gst: r.gst, qst: r.qst,
         taxExemptSales: r.taxExemptSales, taxableSales: r.taxableSales,
         tips: r.tips, pettyCash: r.pettyCash, arAmount: r.arAmount, roundingAdj: r.roundingAdj,
         qboJeId: r.qboJeId, errorMessage: r.errorMessage, postedAt: r.postedAt?.toISOString(),
-        jeLineDetails: r.jeLineDetails,
       }));
 
-      return { content: [{ type: "text", text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
     }
   );
 
@@ -238,7 +223,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       limit: z.number().optional().default(100).describe("Max results"),
     },
     async ({ status, supplier_id, location_id, start_date, end_date, limit }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const conditions: any[] = [];
       if (status) conditions.push(eq(invoices.status, status));
       if (supplier_id) conditions.push(eq(invoices.supplierId, supplier_id));
@@ -253,13 +239,14 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
 
       const result = rows.map(r => ({
         id: r.id, invoiceNumber: r.invoiceNumber, supplierId: r.supplierId,
-        locationId: r.locationId, invoiceDate: toDateStr(r.invoiceDate), dueDate: toDateStr(r.dueDate),
+        locationId: r.locationId, invoiceDate: toDateStr(r.invoiceDate as any),
+        dueDate: toDateStr(r.dueDate as any),
         subtotal: r.subtotal, gst: r.gst, qst: r.qst, total: r.total,
         status: r.status, glAccount: r.glAccount, qboSynced: r.qboSynced,
         qboSyncStatus: r.qboSyncStatus, notes: r.notes,
       }));
 
-      return { content: [{ type: "text", text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
     }
   );
 
@@ -269,11 +256,12 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
     "List all vendors/suppliers",
     {},
     async () => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const rows = await db.select().from(suppliers).orderBy(asc(suppliers.name));
       return {
         content: [{
-          type: "text",
+          type: "text" as const,
           text: JSON.stringify(rows.map(r => ({
             id: r.id, name: r.name, category: r.category,
             contactName: r.contactName, email: r.email, phone: r.phone,
@@ -293,7 +281,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       location_id: z.number().optional().describe("Filter by location ID"),
     },
     async ({ start_date, end_date, location_id }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const conditions: any[] = [
         gte(payrollRecords.weekEnding, new Date(start_date)),
         lte(payrollRecords.weekEnding, new Date(end_date)),
@@ -306,11 +295,11 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
         .limit(200);
 
       const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, weekEnding: toDateStr(r.weekEnding),
+        id: r.id, locationId: r.locationId, weekEnding: toDateStr(r.weekEnding as any),
         totalHours: r.totalHours, totalWages: r.totalWages, employeeCount: r.employeeCount,
       }));
 
-      return { content: [{ type: "text", text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
     }
   );
 
@@ -320,11 +309,12 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
     "List QuickBooks Online company entities with realm IDs and sync status",
     {},
     async () => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const rows = await db.select().from(qboEntities).orderBy(asc(qboEntities.id));
       return {
         content: [{
-          type: "text",
+          type: "text" as const,
           text: JSON.stringify(rows.map(r => ({
             id: r.id, locationId: r.locationId, realmId: r.realmId,
             companyName: r.companyName, legalName: r.legalName,
@@ -348,7 +338,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       limit: z.number().optional().default(100).describe("Max results"),
     },
     async ({ start_date, end_date, location_id, category, limit }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const conditions: any[] = [
         gte(productSales.saleDate, new Date(start_date)),
         lte(productSales.saleDate, new Date(end_date)),
@@ -362,12 +353,12 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
         .limit(limit || 100);
 
       const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate),
+        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
         productName: r.productName, category: r.category, quantity: r.quantity,
         grossSales: r.grossSales, netSales: r.netSales, discounts: r.discounts,
       }));
 
-      return { content: [{ type: "text", text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
     }
   );
 
@@ -379,7 +370,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       entity_id: z.number().optional().describe("QBO entity ID. If omitted, returns all cached accounts."),
     },
     async ({ entity_id }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const conditions: any[] = [];
       if (entity_id) conditions.push(eq(qboAccountCache.entityId, entity_id));
 
@@ -394,7 +386,7 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
         currentBalance: r.currentBalance, isActive: r.isActive,
       }));
 
-      return { content: [{ type: "text", text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
     }
   );
 
@@ -407,7 +399,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       location_id: z.number().optional().describe("Filter by location ID"),
     },
     async ({ fiscal_year, location_id }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const startDate = `${fiscal_year}-09-01`;
       const endDate = `${fiscal_year + 1}-08-31`;
 
@@ -436,7 +429,7 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
 
       return {
         content: [{
-          type: "text",
+          type: "text" as const,
           text: JSON.stringify({
             fiscalYear: `${fiscal_year}/${fiscal_year + 1}`,
             period: `${startDate} to ${endDate}`,
@@ -457,7 +450,8 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       end_date: z.string().optional().describe("End date YYYY-MM-DD"),
     },
     async ({ start_date, end_date }) => {
-      const db = getDb();
+      const db = await getDb();
+      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
       const conditions: any[] = [];
       if (start_date) conditions.push(gte(revenueJournalEntries.saleDate, new Date(start_date)));
       if (end_date) conditions.push(lte(revenueJournalEntries.saleDate, new Date(end_date)));
@@ -472,168 +466,163 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
         .where(conditions.length > 0 ? and(...conditions) : undefined)
         .groupBy(revenueJournalEntries.status, revenueJournalEntries.locationId);
 
-      return { content: [{ type: "text", text: JSON.stringify({ data: rows }, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ data: rows }, null, 2) }] };
     }
   );
 
   return server;
 }
 
-// ─── Express App ───
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// ─── Health Check ───
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "hinnawi-ops-accounting-mcp", version: "1.0.0" });
-});
-
-// ─── OAuth 2.1 Discovery ───
-app.get("/.well-known/oauth-authorization-server", (_req, res) => {
-  res.json({
-    issuer: PUBLIC_URL,
-    authorization_endpoint: `${PUBLIC_URL}/oauth/authorize`,
-    token_endpoint: `${PUBLIC_URL}/oauth/token`,
-    response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code"],
-    code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["client_secret_post"],
-  });
-});
-
-// ─── OAuth 2.1 Authorization Endpoint ───
-app.get("/oauth/authorize", (req, res) => {
-  const { client_id, redirect_uri, response_type, state, code_challenge, code_challenge_method } = req.query as Record<string, string>;
-
-  if (response_type !== "code") {
-    return res.status(400).json({ error: "unsupported_response_type" });
-  }
-  if (client_id !== OAUTH_CLIENT_ID) {
-    return res.status(400).json({ error: "invalid_client" });
-  }
-  if (!code_challenge || code_challenge_method !== "S256") {
-    return res.status(400).json({ error: "invalid_request", description: "PKCE S256 required" });
+// ─── Register MCP Routes on Express App ───
+export function registerMcpRoutes(app: Express): void {
+  if (!MCP_SECRET) {
+    console.log("[MCP] MCP_SECRET not set — MCP endpoint disabled");
+    return;
   }
 
-  // Auto-approve: generate auth code immediately (no user consent screen needed for machine-to-machine)
-  const code = crypto.randomBytes(32).toString("hex");
-  authCodes.set(code, {
-    code,
-    clientId: client_id,
-    redirectUri: redirect_uri,
-    codeChallenge: code_challenge,
-    codeChallengeMethod: code_challenge_method,
-    expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
-  });
-
-  const redirectUrl = new URL(redirect_uri);
-  redirectUrl.searchParams.set("code", code);
-  if (state) redirectUrl.searchParams.set("state", state);
-  res.redirect(302, redirectUrl.toString());
-});
-
-// ─── OAuth 2.1 Token Endpoint ───
-app.post("/oauth/token", (req, res) => {
-  const { grant_type, code, redirect_uri, client_id, client_secret, code_verifier } = req.body;
-
-  if (grant_type !== "authorization_code") {
-    return res.status(400).json({ error: "unsupported_grant_type" });
-  }
-  if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
-    return res.status(401).json({ error: "invalid_client" });
-  }
-
-  const authCode = authCodes.get(code);
-  if (!authCode || authCode.expiresAt < Date.now()) {
-    return res.status(400).json({ error: "invalid_grant", description: "Code expired or invalid" });
-  }
-  if (authCode.redirectUri !== redirect_uri) {
-    return res.status(400).json({ error: "invalid_grant", description: "redirect_uri mismatch" });
-  }
-
-  // Verify PKCE
-  const expectedChallenge = crypto
-    .createHash("sha256")
-    .update(code_verifier || "")
-    .digest("base64url");
-  if (expectedChallenge !== authCode.codeChallenge) {
-    return res.status(400).json({ error: "invalid_grant", description: "PKCE verification failed" });
-  }
-
-  // Issue access token
-  authCodes.delete(code);
-  const accessToken = crypto.randomBytes(48).toString("hex");
-  accessTokens.set(accessToken, {
-    token: accessToken,
-    clientId: client_id,
-    expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-  });
-
-  res.json({
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: 86400,
-  });
-});
-
-// ─── MCP Endpoint (Streamable HTTP) ───
-app.post("/api/mcp", async (req, res) => {
-  if (!authenticate(req, res)) return;
-
-  try {
-    // Create fresh McpServer + transport per request (stateless)
-    const mcpServer = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless
+  // OAuth 2.1 Discovery
+  app.get("/.well-known/oauth-authorization-server", (req, res) => {
+    const publicUrl = getPublicUrl(req);
+    res.json({
+      issuer: publicUrl,
+      authorization_endpoint: `${publicUrl}/oauth/authorize`,
+      token_endpoint: `${publicUrl}/oauth/token`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code"],
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["client_secret_post"],
     });
+  });
 
-    await mcpServer.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+  // OAuth 2.1 Authorization Endpoint
+  app.get("/oauth/authorize", (req, res) => {
+    const { client_id, redirect_uri, response_type, state, code_challenge, code_challenge_method } = req.query as Record<string, string>;
 
-    // Transport is done after handling the request; close cleanly
-    res.on("close", () => {
-      transport.close().catch(() => {});
-      mcpServer.close().catch(() => {});
-    });
-  } catch (error: any) {
-    console.error("MCP request error:", error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Internal server error", message: error.message });
+    if (response_type !== "code") {
+      return res.status(400).json({ error: "unsupported_response_type" });
     }
-  }
-});
-
-// Also handle GET for SSE (some clients use GET for server-initiated notifications)
-app.get("/api/mcp", async (req, res) => {
-  if (!authenticate(req, res)) return;
-
-  try {
-    const mcpServer = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-
-    await mcpServer.connect(transport);
-    await transport.handleRequest(req, res);
-
-    res.on("close", () => {
-      transport.close().catch(() => {});
-      mcpServer.close().catch(() => {});
-    });
-  } catch (error: any) {
-    console.error("MCP GET error:", error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Internal server error", message: error.message });
+    if (client_id !== OAUTH_CLIENT_ID) {
+      return res.status(400).json({ error: "invalid_client" });
     }
-  }
-});
+    if (!code_challenge || code_challenge_method !== "S256") {
+      return res.status(400).json({ error: "invalid_request", description: "PKCE S256 required" });
+    }
 
-// ─── Start Server ───
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Hinnawi Ops MCP Server running on port ${PORT}`);
-  console.log(`Public URL: ${PUBLIC_URL}`);
-  console.log(`MCP endpoint: ${PUBLIC_URL}/api/mcp`);
-  console.log(`OAuth discovery: ${PUBLIC_URL}/.well-known/oauth-authorization-server`);
-  console.log(`Health: ${PUBLIC_URL}/health`);
-});
+    // Auto-approve (machine-to-machine)
+    const code = crypto.randomBytes(32).toString("hex");
+    authCodes.set(code, {
+      code,
+      clientId: client_id,
+      redirectUri: redirect_uri,
+      codeChallenge: code_challenge,
+      codeChallengeMethod: code_challenge_method,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+
+    const redirectUrl = new URL(redirect_uri);
+    redirectUrl.searchParams.set("code", code);
+    if (state) redirectUrl.searchParams.set("state", state);
+    res.redirect(302, redirectUrl.toString());
+  });
+
+  // OAuth 2.1 Token Endpoint
+  app.post("/oauth/token", (req, res) => {
+    const { grant_type, code, redirect_uri, client_id, client_secret, code_verifier } = req.body;
+
+    if (grant_type !== "authorization_code") {
+      return res.status(400).json({ error: "unsupported_grant_type" });
+    }
+    if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
+      return res.status(401).json({ error: "invalid_client" });
+    }
+
+    const authCode = authCodes.get(code);
+    if (!authCode || authCode.expiresAt < Date.now()) {
+      return res.status(400).json({ error: "invalid_grant", description: "Code expired or invalid" });
+    }
+    if (authCode.redirectUri !== redirect_uri) {
+      return res.status(400).json({ error: "invalid_grant", description: "redirect_uri mismatch" });
+    }
+
+    // Verify PKCE
+    const expectedChallenge = crypto
+      .createHash("sha256")
+      .update(code_verifier || "")
+      .digest("base64url");
+    if (expectedChallenge !== authCode.codeChallenge) {
+      return res.status(400).json({ error: "invalid_grant", description: "PKCE verification failed" });
+    }
+
+    authCodes.delete(code);
+    const accessToken = crypto.randomBytes(48).toString("hex");
+    accessTokens.set(accessToken, {
+      token: accessToken,
+      clientId: client_id,
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
+    });
+
+    res.json({
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: 86400,
+    });
+  });
+
+  // MCP Streamable HTTP Endpoint — POST
+  app.post("/api/mcp", async (req: Request, res: Response) => {
+    if (!authenticate(req, res)) return;
+
+    try {
+      const mcpServer = createMcpServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined, // stateless
+      });
+
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+
+      res.on("close", () => {
+        transport.close().catch(() => {});
+        mcpServer.close().catch(() => {});
+      });
+    } catch (error: any) {
+      console.error("[MCP] Request error:", error.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Internal server error", message: error.message });
+      }
+    }
+  });
+
+  // MCP Streamable HTTP Endpoint — GET (for SSE / server-initiated notifications)
+  app.get("/api/mcp", async (req: Request, res: Response) => {
+    if (!authenticate(req, res)) return;
+
+    try {
+      const mcpServer = createMcpServer();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res);
+
+      res.on("close", () => {
+        transport.close().catch(() => {});
+        mcpServer.close().catch(() => {});
+      });
+    } catch (error: any) {
+      console.error("[MCP] GET error:", error.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Internal server error", message: error.message });
+      }
+    }
+  });
+
+  // MCP Health endpoint
+  app.get("/api/mcp/health", (_req, res) => {
+    res.json({ status: "ok", server: "hinnawi-ops-accounting-mcp", version: "1.0.0", tools: 11 });
+  });
+
+  console.log("[MCP] Streamable HTTP endpoint registered at /api/mcp");
+  console.log("[MCP] OAuth discovery at /.well-known/oauth-authorization-server");
+}
