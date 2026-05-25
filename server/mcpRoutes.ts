@@ -30,6 +30,18 @@ const MCP_SECRET = process.env.MCP_SECRET || "";
 const OAUTH_CLIENT_ID = process.env.MCP_OAUTH_CLIENT_ID || "";
 const OAUTH_CLIENT_SECRET = process.env.MCP_OAUTH_CLIENT_SECRET || "";
 
+// Log DATABASE_URL status at module load (password masked)
+(function logDbConfig() {
+  const dbUrl = process.env.DATABASE_URL;
+  if (!dbUrl) {
+    console.error("[MCP][CRITICAL] DATABASE_URL is NOT SET in environment. All tools will return 'Database not available'.");
+  } else {
+    // Mask password in URL for safe logging
+    const masked = dbUrl.replace(/:([^@:]+)@/, ':****@');
+    console.log(`[MCP] DATABASE_URL configured: ${masked}`);
+  }
+})();
+
 function getPublicUrl(req: Request): string {
   // Always derive from request headers for correct behavior behind proxies
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
@@ -116,24 +128,40 @@ All monetary values are in CAD. Fiscal year runs Sep 1 – Aug 31.
 Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
   });
 
+  // ─── Helper: get DB or throw with real error ───
+  async function requireDb(): Promise<NonNullable<Awaited<ReturnType<typeof getDb>>>> {
+    const db = await getDb();
+    if (!db) {
+      const dbUrl = process.env.DATABASE_URL;
+      if (!dbUrl) {
+        throw new Error("DATABASE_URL environment variable is not set. The server cannot connect to the database.");
+      }
+      throw new Error("Database connection failed. DATABASE_URL is set but drizzle() returned null. Check server logs for connection errors.");
+    }
+    return db;
+  }
+
   // ─── Tool: get_locations ───
   server.tool(
     "get_locations",
     "List all cafe locations with their codes, names, and targets",
     {},
     async () => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const rows = await db.select().from(locations).orderBy(asc(locations.id));
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify(rows.map(r => ({
-            id: r.id, code: r.code, name: r.name, entityName: r.entityName,
-            address: r.address, laborTarget: r.laborTarget, foodCostTarget: r.foodCostTarget, isActive: r.isActive,
-          })), null, 2),
-        }],
-      };
+      try {
+        const db = await requireDb();
+        const rows = await db.select().from(locations).orderBy(asc(locations.id));
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(rows.map(r => ({
+              id: r.id, code: r.code, name: r.name, entityName: r.entityName,
+              address: r.address, laborTarget: r.laborTarget, foodCostTarget: r.foodCostTarget, isActive: r.isActive,
+            })), null, 2),
+          }],
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -147,28 +175,31 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       location_id: z.number().optional().describe("Filter by location ID (1=PK, 2=Mackay, 3=Ontario, 4=Cathcart)"),
     },
     async ({ start_date, end_date, location_id }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const conditions: any[] = [
-        gte(dailySales.saleDate, new Date(start_date)),
-        lte(dailySales.saleDate, new Date(end_date)),
-      ];
-      if (location_id) conditions.push(eq(dailySales.locationId, location_id));
+      try {
+        const db = await requireDb();
+        const conditions: any[] = [
+          gte(dailySales.saleDate, new Date(start_date)),
+          lte(dailySales.saleDate, new Date(end_date)),
+        ];
+        if (location_id) conditions.push(eq(dailySales.locationId, location_id));
 
-      const rows = await db.select().from(dailySales)
-        .where(and(...conditions))
-        .orderBy(desc(dailySales.saleDate), asc(dailySales.locationId))
-        .limit(500);
+        const rows = await db.select().from(dailySales)
+          .where(and(...conditions))
+          .orderBy(desc(dailySales.saleDate), asc(dailySales.locationId))
+          .limit(500);
 
-      const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
-        totalSales: r.totalSales, taxExemptSales: r.taxExemptSales, taxableSales: r.taxableSales,
-        gstCollected: r.gstCollected, qstCollected: r.qstCollected, totalDeposit: r.totalDeposit,
-        tipsCollected: r.tipsCollected, merchantFees: r.merchantFees, pettyCash: r.pettyCash,
-        discounts: r.discounts, labourCost: r.labourCost, orderCount: r.orderCount,
-      }));
+        const result = rows.map(r => ({
+          id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
+          totalSales: r.totalSales, taxExemptSales: r.taxExemptSales, taxableSales: r.taxableSales,
+          gstCollected: r.gstCollected, qstCollected: r.qstCollected, totalDeposit: r.totalDeposit,
+          tipsCollected: r.tipsCollected, merchantFees: r.merchantFees, pettyCash: r.pettyCash,
+          discounts: r.discounts, labourCost: r.labourCost, orderCount: r.orderCount,
+        }));
 
-      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -184,29 +215,32 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       limit: z.number().optional().default(100).describe("Max results (default 100)"),
     },
     async ({ status, location_id, start_date, end_date, limit }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const conditions: any[] = [];
-      if (status) conditions.push(eq(revenueJournalEntries.status, status));
-      if (location_id) conditions.push(eq(revenueJournalEntries.locationId, location_id));
-      if (start_date) conditions.push(gte(revenueJournalEntries.saleDate, new Date(start_date)));
-      if (end_date) conditions.push(lte(revenueJournalEntries.saleDate, new Date(end_date)));
+      try {
+        const db = await requireDb();
+        const conditions: any[] = [];
+        if (status) conditions.push(eq(revenueJournalEntries.status, status));
+        if (location_id) conditions.push(eq(revenueJournalEntries.locationId, location_id));
+        if (start_date) conditions.push(gte(revenueJournalEntries.saleDate, new Date(start_date)));
+        if (end_date) conditions.push(lte(revenueJournalEntries.saleDate, new Date(end_date)));
 
-      const rows = await db.select().from(revenueJournalEntries)
-        .where(conditions.length > 0 ? and(...conditions) : undefined)
-        .orderBy(desc(revenueJournalEntries.saleDate))
-        .limit(limit || 100);
+        const rows = await db.select().from(revenueJournalEntries)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .orderBy(desc(revenueJournalEntries.saleDate))
+          .limit(limit || 100);
 
-      const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
-        realmId: r.realmId, docNumber: r.docNumber, status: r.status,
-        totalSales: r.totalSales, netRevenue: r.netRevenue, gst: r.gst, qst: r.qst,
-        taxExemptSales: r.taxExemptSales, taxableSales: r.taxableSales,
-        tips: r.tips, pettyCash: r.pettyCash, arAmount: r.arAmount, roundingAdj: r.roundingAdj,
-        qboJeId: r.qboJeId, errorMessage: r.errorMessage, postedAt: r.postedAt?.toISOString(),
-      }));
+        const result = rows.map(r => ({
+          id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
+          realmId: r.realmId, docNumber: r.docNumber, status: r.status,
+          totalSales: r.totalSales, netRevenue: r.netRevenue, gst: r.gst, qst: r.qst,
+          taxExemptSales: r.taxExemptSales, taxableSales: r.taxableSales,
+          tips: r.tips, pettyCash: r.pettyCash, arAmount: r.arAmount, roundingAdj: r.roundingAdj,
+          qboJeId: r.qboJeId, errorMessage: r.errorMessage, postedAt: r.postedAt?.toISOString(),
+        }));
 
-      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -223,30 +257,33 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       limit: z.number().optional().default(100).describe("Max results"),
     },
     async ({ status, supplier_id, location_id, start_date, end_date, limit }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const conditions: any[] = [];
-      if (status) conditions.push(eq(invoices.status, status));
-      if (supplier_id) conditions.push(eq(invoices.supplierId, supplier_id));
-      if (location_id) conditions.push(eq(invoices.locationId, location_id));
-      if (start_date) conditions.push(gte(invoices.invoiceDate, new Date(start_date)));
-      if (end_date) conditions.push(lte(invoices.invoiceDate, new Date(end_date)));
+      try {
+        const db = await requireDb();
+        const conditions: any[] = [];
+        if (status) conditions.push(eq(invoices.status, status));
+        if (supplier_id) conditions.push(eq(invoices.supplierId, supplier_id));
+        if (location_id) conditions.push(eq(invoices.locationId, location_id));
+        if (start_date) conditions.push(gte(invoices.invoiceDate, new Date(start_date)));
+        if (end_date) conditions.push(lte(invoices.invoiceDate, new Date(end_date)));
 
-      const rows = await db.select().from(invoices)
-        .where(conditions.length > 0 ? and(...conditions) : undefined)
-        .orderBy(desc(invoices.createdAt))
-        .limit(limit || 100);
+        const rows = await db.select().from(invoices)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .orderBy(desc(invoices.createdAt))
+          .limit(limit || 100);
 
-      const result = rows.map(r => ({
-        id: r.id, invoiceNumber: r.invoiceNumber, supplierId: r.supplierId,
-        locationId: r.locationId, invoiceDate: toDateStr(r.invoiceDate as any),
-        dueDate: toDateStr(r.dueDate as any),
-        subtotal: r.subtotal, gst: r.gst, qst: r.qst, total: r.total,
-        status: r.status, glAccount: r.glAccount, qboSynced: r.qboSynced,
-        qboSyncStatus: r.qboSyncStatus, notes: r.notes,
-      }));
+        const result = rows.map(r => ({
+          id: r.id, invoiceNumber: r.invoiceNumber, supplierId: r.supplierId,
+          locationId: r.locationId, invoiceDate: toDateStr(r.invoiceDate as any),
+          dueDate: toDateStr(r.dueDate as any),
+          subtotal: r.subtotal, gst: r.gst, qst: r.qst, total: r.total,
+          status: r.status, glAccount: r.glAccount, qboSynced: r.qboSynced,
+          qboSyncStatus: r.qboSyncStatus, notes: r.notes,
+        }));
 
-      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -256,18 +293,21 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
     "List all vendors/suppliers",
     {},
     async () => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const rows = await db.select().from(suppliers).orderBy(asc(suppliers.name));
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify(rows.map(r => ({
-            id: r.id, name: r.name, category: r.category,
-            contactName: r.contactName, email: r.email, phone: r.phone,
-          })), null, 2),
-        }],
-      };
+      try {
+        const db = await requireDb();
+        const rows = await db.select().from(suppliers).orderBy(asc(suppliers.name));
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(rows.map(r => ({
+              id: r.id, name: r.name, category: r.category,
+              contactName: r.contactName, email: r.email, phone: r.phone,
+            })), null, 2),
+          }],
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -281,25 +321,28 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       location_id: z.number().optional().describe("Filter by location ID"),
     },
     async ({ start_date, end_date, location_id }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const conditions: any[] = [
-        gte(payrollRecords.weekEnding, new Date(start_date)),
-        lte(payrollRecords.weekEnding, new Date(end_date)),
-      ];
-      if (location_id) conditions.push(eq(payrollRecords.locationId, location_id));
+      try {
+        const db = await requireDb();
+        const conditions: any[] = [
+          gte(payrollRecords.weekEnding, new Date(start_date)),
+          lte(payrollRecords.weekEnding, new Date(end_date)),
+        ];
+        if (location_id) conditions.push(eq(payrollRecords.locationId, location_id));
 
-      const rows = await db.select().from(payrollRecords)
-        .where(and(...conditions))
-        .orderBy(desc(payrollRecords.weekEnding))
-        .limit(200);
+        const rows = await db.select().from(payrollRecords)
+          .where(and(...conditions))
+          .orderBy(desc(payrollRecords.weekEnding))
+          .limit(200);
 
-      const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, weekEnding: toDateStr(r.weekEnding as any),
-        totalHours: r.totalHours, totalWages: r.totalWages, employeeCount: r.employeeCount,
-      }));
+        const result = rows.map(r => ({
+          id: r.id, locationId: r.locationId, weekEnding: toDateStr(r.weekEnding as any),
+          totalHours: r.totalHours, totalWages: r.totalWages, employeeCount: r.employeeCount,
+        }));
 
-      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -309,20 +352,23 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
     "List QuickBooks Online company entities with realm IDs and sync status",
     {},
     async () => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const rows = await db.select().from(qboEntities).orderBy(asc(qboEntities.id));
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify(rows.map(r => ({
-            id: r.id, locationId: r.locationId, realmId: r.realmId,
-            companyName: r.companyName, legalName: r.legalName,
-            fiscalYearStartMonth: r.fiscalYearStartMonth, syncStatus: r.syncStatus,
-            isActive: r.isActive, lastSyncAt: r.lastSyncAt?.toISOString(),
-          })), null, 2),
-        }],
-      };
+      try {
+        const db = await requireDb();
+        const rows = await db.select().from(qboEntities).orderBy(asc(qboEntities.id));
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(rows.map(r => ({
+              id: r.id, locationId: r.locationId, realmId: r.realmId,
+              companyName: r.companyName, legalName: r.legalName,
+              fiscalYearStartMonth: r.fiscalYearStartMonth, syncStatus: r.syncStatus,
+              isActive: r.isActive, lastSyncAt: r.lastSyncAt?.toISOString(),
+            })), null, 2),
+          }],
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -338,27 +384,30 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       limit: z.number().optional().default(100).describe("Max results"),
     },
     async ({ start_date, end_date, location_id, category, limit }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const conditions: any[] = [
-        gte(productSales.saleDate, new Date(start_date)),
-        lte(productSales.saleDate, new Date(end_date)),
-      ];
-      if (location_id) conditions.push(eq(productSales.locationId, location_id));
-      if (category) conditions.push(eq(productSales.category, category));
+      try {
+        const db = await requireDb();
+        const conditions: any[] = [
+          gte(productSales.saleDate, new Date(start_date)),
+          lte(productSales.saleDate, new Date(end_date)),
+        ];
+        if (location_id) conditions.push(eq(productSales.locationId, location_id));
+        if (category) conditions.push(eq(productSales.category, category));
 
-      const rows = await db.select().from(productSales)
-        .where(and(...conditions))
-        .orderBy(desc(productSales.saleDate))
-        .limit(limit || 100);
+        const rows = await db.select().from(productSales)
+          .where(and(...conditions))
+          .orderBy(desc(productSales.saleDate))
+          .limit(limit || 100);
 
-      const result = rows.map(r => ({
-        id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
-        productName: r.productName, category: r.category, quantity: r.quantity,
-        grossSales: r.grossSales, netSales: r.netSales, discounts: r.discounts,
-      }));
+        const result = rows.map(r => ({
+          id: r.id, locationId: r.locationId, saleDate: toDateStr(r.saleDate as any),
+          productName: r.productName, category: r.category, quantity: r.quantity,
+          grossSales: r.grossSales, netSales: r.netSales, discounts: r.discounts,
+        }));
 
-      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -370,23 +419,26 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       entity_id: z.number().optional().describe("QBO entity ID. If omitted, returns all cached accounts."),
     },
     async ({ entity_id }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const conditions: any[] = [];
-      if (entity_id) conditions.push(eq(qboAccountCache.entityId, entity_id));
+      try {
+        const db = await requireDb();
+        const conditions: any[] = [];
+        if (entity_id) conditions.push(eq(qboAccountCache.entityId, entity_id));
 
-      const rows = await db.select().from(qboAccountCache)
-        .where(conditions.length > 0 ? and(...conditions) : undefined)
-        .orderBy(asc(qboAccountCache.accountType), asc(qboAccountCache.name))
-        .limit(500);
+        const rows = await db.select().from(qboAccountCache)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .orderBy(asc(qboAccountCache.accountType), asc(qboAccountCache.name))
+          .limit(500);
 
-      const result = rows.map(r => ({
-        id: r.id, entityId: r.entityId, qboAccountId: r.qboAccountId,
-        name: r.name, accountType: r.accountType, accountSubType: r.accountSubType,
-        currentBalance: r.currentBalance, isActive: r.isActive,
-      }));
+        const result = rows.map(r => ({
+          id: r.id, entityId: r.entityId, qboAccountId: r.qboAccountId,
+          name: r.name, accountType: r.accountType, accountSubType: r.accountSubType,
+          currentBalance: r.currentBalance, isActive: r.isActive,
+        }));
 
-      return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ count: result.length, data: result }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -399,45 +451,48 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       location_id: z.number().optional().describe("Filter by location ID"),
     },
     async ({ fiscal_year, location_id }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const startDate = `${fiscal_year}-09-01`;
-      const endDate = `${fiscal_year + 1}-08-31`;
+      try {
+        const db = await requireDb();
+        const startDate = `${fiscal_year}-09-01`;
+        const endDate = `${fiscal_year + 1}-08-31`;
 
-      const conditions: any[] = [
-        gte(dailySales.saleDate, new Date(startDate)),
-        lte(dailySales.saleDate, new Date(endDate)),
-      ];
-      if (location_id) conditions.push(eq(dailySales.locationId, location_id));
+        const conditions: any[] = [
+          gte(dailySales.saleDate, new Date(startDate)),
+          lte(dailySales.saleDate, new Date(endDate)),
+        ];
+        if (location_id) conditions.push(eq(dailySales.locationId, location_id));
 
-      const rows = await db.select({
-        month: sql<string>`DATE_FORMAT(${dailySales.saleDate}, '%Y-%m')`,
-        locationId: dailySales.locationId,
-        totalSales: sql<string>`SUM(${dailySales.totalSales})`,
-        totalDeposit: sql<string>`SUM(${dailySales.totalDeposit})`,
-        totalGst: sql<string>`SUM(${dailySales.gstCollected})`,
-        totalQst: sql<string>`SUM(${dailySales.qstCollected})`,
-        totalTips: sql<string>`SUM(${dailySales.tipsCollected})`,
-        totalLabour: sql<string>`SUM(${dailySales.labourCost})`,
-        totalOrders: sql<number>`SUM(${dailySales.orderCount})`,
-        dayCount: sql<number>`COUNT(*)`,
-      })
-        .from(dailySales)
-        .where(and(...conditions))
-        .groupBy(sql`DATE_FORMAT(${dailySales.saleDate}, '%Y-%m')`, dailySales.locationId)
-        .orderBy(sql`DATE_FORMAT(${dailySales.saleDate}, '%Y-%m')`, asc(dailySales.locationId));
+        const rows = await db.select({
+          month: sql<string>`DATE_FORMAT(${dailySales.saleDate}, '%Y-%m')`,
+          locationId: dailySales.locationId,
+          totalSales: sql<string>`SUM(${dailySales.totalSales})`,
+          totalDeposit: sql<string>`SUM(${dailySales.totalDeposit})`,
+          totalGst: sql<string>`SUM(${dailySales.gstCollected})`,
+          totalQst: sql<string>`SUM(${dailySales.qstCollected})`,
+          totalTips: sql<string>`SUM(${dailySales.tipsCollected})`,
+          totalLabour: sql<string>`SUM(${dailySales.labourCost})`,
+          totalOrders: sql<number>`SUM(${dailySales.orderCount})`,
+          dayCount: sql<number>`COUNT(*)`,
+        })
+          .from(dailySales)
+          .where(and(...conditions))
+          .groupBy(sql`DATE_FORMAT(${dailySales.saleDate}, '%Y-%m')`, dailySales.locationId)
+          .orderBy(sql`DATE_FORMAT(${dailySales.saleDate}, '%Y-%m')`, asc(dailySales.locationId));
 
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            fiscalYear: `${fiscal_year}/${fiscal_year + 1}`,
-            period: `${startDate} to ${endDate}`,
-            count: rows.length,
-            data: rows,
-          }, null, 2),
-        }],
-      };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              fiscalYear: `${fiscal_year}/${fiscal_year + 1}`,
+              period: `${startDate} to ${endDate}`,
+              count: rows.length,
+              data: rows,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -450,23 +505,26 @@ Ontario location is in Quebec (charges GST 5% + QST 9.975%).`,
       end_date: z.string().optional().describe("End date YYYY-MM-DD"),
     },
     async ({ start_date, end_date }) => {
-      const db = await getDb();
-      if (!db) return { content: [{ type: "text" as const, text: "Database not available" }] };
-      const conditions: any[] = [];
-      if (start_date) conditions.push(gte(revenueJournalEntries.saleDate, new Date(start_date)));
-      if (end_date) conditions.push(lte(revenueJournalEntries.saleDate, new Date(end_date)));
+      try {
+        const db = await requireDb();
+        const conditions: any[] = [];
+        if (start_date) conditions.push(gte(revenueJournalEntries.saleDate, new Date(start_date)));
+        if (end_date) conditions.push(lte(revenueJournalEntries.saleDate, new Date(end_date)));
 
-      const rows = await db.select({
-        status: revenueJournalEntries.status,
-        locationId: revenueJournalEntries.locationId,
-        count: sql<number>`COUNT(*)`,
-        totalSales: sql<string>`SUM(${revenueJournalEntries.totalSales})`,
-      })
-        .from(revenueJournalEntries)
-        .where(conditions.length > 0 ? and(...conditions) : undefined)
-        .groupBy(revenueJournalEntries.status, revenueJournalEntries.locationId);
+        const rows = await db.select({
+          status: revenueJournalEntries.status,
+          locationId: revenueJournalEntries.locationId,
+          count: sql<number>`COUNT(*)`,
+          totalSales: sql<string>`SUM(${revenueJournalEntries.totalSales})`,
+        })
+          .from(revenueJournalEntries)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .groupBy(revenueJournalEntries.status, revenueJournalEntries.locationId);
 
-      return { content: [{ type: "text" as const, text: JSON.stringify({ data: rows }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ data: rows }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: `ERROR: ${error.message}\n\nStack: ${error.stack?.slice(0, 500) || 'N/A'}` }] };
+      }
     }
   );
 
@@ -618,9 +676,41 @@ export function registerMcpRoutes(app: Express): void {
     }
   });
 
-  // MCP Health endpoint
-  app.get("/api/mcp/health", (_req, res) => {
-    res.json({ status: "ok", server: "hinnawi-ops-accounting-mcp", version: "1.0.0", tools: 11 });
+  // MCP Health endpoint — runs real DB query
+  app.get("/api/mcp/health", async (_req, res) => {
+    const dbUrl = process.env.DATABASE_URL;
+    const dbUrlMasked = dbUrl ? dbUrl.replace(/:([^@:]+)@/, ':****@') : 'NOT SET';
+    let dbStatus = 'not_configured';
+    let dbError: string | null = null;
+
+    if (dbUrl) {
+      try {
+        const db = await getDb();
+        if (db) {
+          const result = await db.execute(sql`SELECT 1 as ping`);
+          dbStatus = 'connected';
+        } else {
+          dbStatus = 'failed';
+          dbError = 'getDb() returned null despite DATABASE_URL being set';
+        }
+      } catch (err: any) {
+        dbStatus = 'error';
+        dbError = err.message;
+      }
+    }
+
+    const statusCode = dbStatus === 'connected' ? 200 : 503;
+    res.status(statusCode).json({
+      status: dbStatus === 'connected' ? 'ok' : 'degraded',
+      server: 'hinnawi-ops-accounting-mcp',
+      version: '1.0.1',
+      tools: 11,
+      database: {
+        status: dbStatus,
+        url: dbUrlMasked,
+        error: dbError,
+      },
+    });
   });
 
   console.log("[MCP] Streamable HTTP endpoint registered at /api/mcp");
